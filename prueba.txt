@@ -1,3 +1,577 @@
-hola saludos!!!
+namespace CPM.LectorSQL.Aplicacion.Helpers
+{
+    using System;
+    using System.Collections.Generic;
+    using System.ComponentModel.DataAnnotations.Schema;
+    using System.Diagnostics;
+    using System.Linq;
+    using System.Text;
+    using System.Text.RegularExpressions;
+    using CPM.LectorSQL.Aplicacion.DTOs;
+    using Microsoft.Extensions.Primitives;
 
-saludos desde GitHub
+    /// <summary>
+    /// Propósito: Clase auxiliar para extraccion de campos de un archivo.
+    /// Fecha de creación: 10/12/2024.
+    /// Creador: Jose Abraham Alonso Ortega (AOOA22956).
+    /// Modificó:
+    /// Dependencias de conexiones e interfaces: No Aplica.
+    /// </summary>
+    public static class ObtnerCampos
+    {
+        /// <summary>
+        /// Revisa un query para inicar con el proceso de extracción de los campos.
+        /// </summary>
+        /// <param name="rawQuery">Consulta a revisar.</param>
+        /// <returns>Un objeto que contiene los campos  tablas obyenidos de los diferente querys.</returns>
+        public static List<SqlOperationDTO> ProcessSqlStatement(string rawQuery)
+        {
+            List<SqlOperationDTO> operations = new List<SqlOperationDTO>();
+
+            // Extraer tabla y campos
+            List<(string Tabla, string Alias)> tableName = ExtractTableNames(rawQuery);
+            List<string> fields = ExtractFields(rawQuery);
+
+            List<object> updatedFields = ReplaceAliasWithTableName(fields, tableName);
+
+            // Crear y agregar el objeto SqlOperationDTO
+            if (updatedFields.Count > 0)
+            {
+                operations.Add(new SqlOperationDTO
+                {
+                    Fields = updatedFields,
+                });
+            }
+
+            return operations;
+        }
+
+        /// <summary>
+        /// Revisa un query y quita todas las posibles funciones SQL que se le pueden aplicar a un campo.
+        /// </summary>
+        /// <param name="field">Consulta a revisar.</param>
+        /// <returns>Una cadena con el nombre o los nombres de los campos limpios.</returns>
+        public static string RemoveFunction(string field)
+        {
+            // Lista de palabras reservadas que queremos eliminar
+            var reservedWords = new[]
+            {
+                "SELECT", "FROM", "WHERE", "JOIN", "INNER", "LEFT", "RIGHT", "FULL",
+                "ON", "GROUP", "HAVING", "ORDER", "ASC", "DESC", "LIMIT", "OFFSET",
+                "CASE", "WHEN", "THEN", "END", "IF", "ELSE",
+                "DISTINCT", "ISNULL", "NULLIF", "COALESCE", "LIKE",
+                "BETWEEN", "EXISTS", "TRUNC", "ROUND",
+                "IFNULL", "TRIM", "CAST", "OPTIMIZE", "FOR", "ALL", "ROWS", "BY",
+                "INSERT", "UPDATE", "DELETE", "CREATE", "DROP", "ALTER", "INDEX",
+                "TABLE", "VIEW", "TRIGGER", "PROCEDURE", "FUNCTION", "DATABASE",
+                "USER", "GRANT", "REVOKE", "COMMIT", "ROLLBACK", "TRANSACTION",
+                "LOCK", "UNLOCK", "FETCH", "CURSOR", "WITH", "VALUES", "SET",
+                "OUTER", "AND", "OR", "DIGITS", "ONLY", "NOT", "TO_CHAR", "CHAR",
+            };
+
+            // Eliminar palabras reservadas
+            foreach (var word in reservedWords)
+            {
+                field = Regex.Replace(field, $@"\b{word}\b", string.Empty, RegexOptions.IgnoreCase);
+            }
+
+            field = Regex.Replace(field, @"=\s*''''(\w+)''''", string.Empty);
+            
+            field = Regex.Replace(field, @"='''\s*\|\|\s*\w+\s*\|\|\s*'''", string.Empty);
+
+            // Eliminar funciones como Round(x.LNBAL), IfNull(x.LN9AIL, 0), etc.
+            var functionRegex = new Regex(@"\b[a-zA-Z_]+\(([^)]+)\)|\bIN\s*\([^)]*\)", RegexOptions.IgnoreCase);
+            field = functionRegex.Replace(field, "$1");
+
+            // Eliminar alias como "AS NombreCampo" o "NombreCampo Alias"
+            field = Regex.Replace(field, @"\bAS\b\s+\w+", string.Empty, RegexOptions.IgnoreCase);
+
+            // Eliminar alias sin "AS" (sin afectar el último elemento)
+            field = Regex.Replace(field, @"\s+\w+(?=,\s*|$)", string.Empty, RegexOptions.IgnoreCase);
+          
+            string pattern = @"\s*\(([^()]*?)\)\s+(\w+)";
+
+            // Reemplazar el alias que sigue a los paréntesis
+            field = Regex.Replace(field, pattern, match =>
+            {
+                // Retornar el contenido de los paréntesis y eliminar el alias
+                return $"({match.Groups[1].Value})"; // Mantener el contenido dentro de los paréntesis
+            });
+
+            // Eliminar números y valores específicos como "0", "2", "20"
+            field = Regex.Replace(field, @"\b\d+\b", string.Empty, RegexOptions.IgnoreCase);
+
+            // Eliminar operadores matemáticos (+, -, *, /) y signos de puntuación innecesarios
+            field = Regex.Replace(field, @"[+\-*/=<>]", " ");
+
+            // Limpiar caracteres adicionales y paréntesis
+            field = field.Replace("(", string.Empty).Replace(")", string.Empty).Replace("\"", string.Empty).Replace("'", string.Empty).Trim();
+
+            field = Regex.Replace(field, @"[\'|]", string.Empty);
+
+            field = Regex.Replace(field, @"BIBLIO\s*\.", string.Empty, RegexOptions.IgnoreCase);
+
+            // Eliminar múltiples espacios consecutivos
+            field = Regex.Replace(field, @"\s{2,}", " ");
+
+            return field.Trim();
+        }
+
+        /// <summary>
+        /// Revisa un query para generar un diccionarion con las tablas utilizadas en las consultas y sus alias en caso de tenrlo.
+        /// </summary>
+        /// <param name="query">Consulta a revisar.</param>
+        /// <returns>Un objeto que contiene los campos  tablas obyenidos de los diferente querys.</returns>
+        private static List<(string TableName, string Alias)> ExtractTableNames(string query)
+        {
+            var tableRegex = new Regex(@"(?:FROM|JOIN|INTO|UPDATE|DELETE\s+FROM)\s+(?<TableName>[\w.]+) (?:\s+AS\s+(?<Alias>[\w]+)|\s+(?<Alias>[\w]+))? ", RegexOptions.IgnoreCase | RegexOptions.IgnorePatternWhitespace);
+
+            query = Regex.Replace(query, @"[\'|]", string.Empty);
+            query = Regex.Replace(query, @"BIBLIO\s*\.", string.Empty, RegexOptions.IgnoreCase);
+
+            var matches = tableRegex.Matches(query);
+            var tables = new List<(string TableName, string Alias)>();
+            var aliasCount = new Dictionary<string, int>(); // Para contar las ocurrencias de cada alias
+
+            foreach (Match match in matches)
+            {
+                var tableName = match.Groups["TableName"].Value;
+                var alias = match.Groups["Alias"].Success ? match.Groups["Alias"].Value : null;
+
+                if (alias != null && (alias.Equals("WHERE", StringComparison.OrdinalIgnoreCase) || alias.Equals("JOIN", StringComparison.OrdinalIgnoreCase) || alias.Equals("ON", StringComparison.OrdinalIgnoreCase)))
+                {
+                    alias = null;
+                }
+
+                // Solo agregar si el nombre de la tabla no está vacío
+                if (!string.IsNullOrEmpty(tableName))
+                {
+                    string tableNameWithoutSchema = tableName.Contains('.') ? tableName.Split('.').Last() : tableName;
+
+                    // Manejar alias duplicados
+                    if (!string.IsNullOrEmpty(alias))
+                    {
+                        if (aliasCount.ContainsKey(alias))
+                        {
+                            // Incrementar el contador para el alias existente
+                            aliasCount[alias]++;
+                            alias += $"_{aliasCount[alias]}"; // Agregar el número al alias
+                        }
+                        else
+                        {
+                            aliasCount[alias] = 1; // Inicializar el contador para el nuevo alias
+                        }
+                    }
+
+                    tables.Add((tableNameWithoutSchema!, alias!));
+                }
+            }
+
+            return tables;
+        }
+
+        /// <summary>
+        /// Revisa un query para generar un diccionario con los campos utilizados en las consultas.
+        /// </summary>
+        /// <param name="query">Consulta a revisar.</param>
+        /// <returns>Una lista con los nombres de los campos.</returns>
+        private static List<string> ExtractFields(string query)
+        {
+            // Normalizar la consulta para no diferenciar entre mayúsculas y minúsculas
+            query = query.Replace("\\", string.Empty).Replace("\"", string.Empty).Trim();
+
+            // Inicializamos una lista para almacenar los campos
+            List<string> fields = new List<string>();
+
+            // Verificamos si la consulta es un SELECT
+            if (query.StartsWith("Select", StringComparison.OrdinalIgnoreCase)
+                || query.StartsWith("With", StringComparison.OrdinalIgnoreCase))
+            {
+                string subQueryConsulta = string.Empty;
+                if (ContainsSubquery(query))
+                {
+                    subQueryConsulta = ExtractSubqueries(query);
+
+                }
+
+                // Extraer campos de expresiones CASE
+                Regex? caseRegex = new Regex(@"CASE.*?END", RegexOptions.IgnoreCase);
+                MatchCollection? caseMatches = caseRegex.Matches(query);
+                foreach (Match caseMatch in caseMatches)
+                {
+                    fields.AddRange(ExtractFieldsFromCase(ref query)); // Pasar la parte de la consulta por referencia
+                }
+
+                Regex? subqueryRegex = new Regex(@"\((SELECT.*?FROM.*?)\)", RegexOptions.IgnoreCase);
+                MatchCollection? subqueryMatches = subqueryRegex.Matches(query);
+                foreach (Match subqueryMatch in subqueryMatches)
+                {
+                    // Extraer la subconsulta
+                    var subquery = subqueryMatch.Groups[1].Value;
+
+                    // Obtener el nombre de la tabla de la subconsulta
+                    (string TableName, string Alias) resultado = GetSubqueryTableName(subquery);
+
+                    // Modificar el campo de la subconsulta para incluir el nombre de la tabla
+                    var modifiedSubquery = ModifySubqueryWithTableName(subquery, resultado.TableName, resultado.Alias);
+                 
+                    fields.AddRange(ExtractFieldsFromSelect(modifiedSubquery));                     
+                    fields.AddRange(ExtractFieldsFromWhereClause(modifiedSubquery));
+                }
+
+                // Extraemos los campos de un SELECT
+                var selectPart = query.Substring(query.IndexOf("Select", StringComparison.OrdinalIgnoreCase) + 6);
+                int lastIndex = query.LastIndexOf("FROM", StringComparison.OrdinalIgnoreCase);
+                //// var fieldsPart = Regex.Split(selectPart, @"^(.*?)(FROM\s+.*)$", RegexOptions.IgnoreCase)[0];
+                string fieldsPart = query.Replace("*", " ").Substring(0, lastIndex).Trim();
+                fields.AddRange(ExtractFieldsFromSelect(fieldsPart));
+
+                if (query.IndexOf("join", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    string joinPart = query.Substring(lastIndex).Trim();
+                    fields.AddRange(ExtractFieldsFromSelect(joinPart));
+                }
+
+                if (query.IndexOf("where", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    var wherePart = Regex.Split(query, @"\s+where\s+", RegexOptions.IgnoreCase)[1];
+                    fields.AddRange(ExtractFieldsFromWhereClause(wherePart));
+                }
+            }
+            else if (query.StartsWith("Update", StringComparison.OrdinalIgnoreCase))
+            {
+                // Si es un UPDATE, extraemos los campos del SET
+                var setPart = query.Substring(query.IndexOf("Set", StringComparison.OrdinalIgnoreCase) + 3);
+                var wherePart = setPart.Split(new[] { "Where" }, StringSplitOptions.None)[0];
+                var wherePart2 = setPart.Split(new[] { "Where" }, StringSplitOptions.None)[1];
+                fields = ExtractFieldsFromUpdate(wherePart);
+                fields.AddRange(ExtractFieldsFromWhereClause(wherePart2));
+            }
+            else if (query.StartsWith("Delete", StringComparison.OrdinalIgnoreCase))
+            {
+                // Si es un DELETE, extraemos los campos de la cláusula WHERE
+                var wherePart = query.Substring(query.IndexOf("Where", StringComparison.OrdinalIgnoreCase) + 5);
+                fields = ExtractFieldsFromWhereClause(wherePart);
+            }
+
+            return fields;
+        }
+
+        /// <summary>
+        /// Extrae el nombre de una tabla en un subquery de selección.
+        /// </summary>
+        /// <param name="subquery">Subconsulta a revisar.</param>
+        /// <returns>Una lista con los nombres de los campos.</returns>
+        private static (string TableName, string Alias) GetSubqueryTableName(string subquery)
+        {
+            (string TableName, string Alias) resultado = ExtractTableNames(subquery)[0];
+            return (resultado.TableName, resultado.Alias);
+        }
+
+        /// <summary>
+        /// extrae el nombre de una tabla en un subquery de selección.
+        /// </summary>
+        /// <param name="subquery">Subconsulta a revisar.</param>
+        /// <param name="tableName">Nombre de la tabl en el subquery.</param>
+        /// <param name="alias">Alias de la tabla en el subquery.</param>
+        /// <returns>Una lista con los nombres de los campos.</returns>
+        private static string ModifySubqueryWithTableName(string subquery, string tableName, string alias)
+        {
+            string cadena = RemoveFunction(subquery);
+
+            // Determinar el alias a usar; si está vacío, usar el nombre de la tabla
+            string strAlias = string.IsNullOrWhiteSpace(alias) ? tableName : alias;
+
+            // Crear un patrón para buscar el alias en la subconsulta
+            string pattern = $@"\b{Regex.Escape(strAlias)}\b";
+
+            // Reemplazar el alias con el nombre de la tabla
+            string modifiedSubquery = Regex.Replace(cadena, pattern, tableName, RegexOptions.IgnoreCase);
+
+            // Modificar la cláusula SELECT para incluir el alias o el nombre de la tabla
+            if (alias == null)
+            {
+                return $"SELECT {tableName}.{modifiedSubquery}";
+            }
+            
+            return $"SELECT {modifiedSubquery}";
+        }
+        
+        /// <summary>
+        /// extrae los campos de un case when.
+        /// </summary>
+        /// <param name="query">Consulta a revisar.</param>
+        /// <returns>Una lista con los nombres de los campos.</returns>
+        private static List<string> ExtractFieldsFromCase(ref string query) 
+        { 
+            var fields = new HashSet<string>(StringComparer.OrdinalIgnoreCase); 
+            var casePattern = @"CASE\s+(WHEN.*?END)"; 
+            var caseRegex = new Regex(casePattern, RegexOptions.IgnoreCase | RegexOptions.Singleline); 
+            var fieldPattern = @"WHEN\s+(?<Field>[a-zA-Z0-9_().]+)\s*(=|!=|<|>|<=|>=|<>)"; 
+            foreach (Match caseMatch in caseRegex.Matches(query)) 
+            { 
+                foreach (Match fieldMatch in Regex.Matches(caseMatch.Value, fieldPattern, RegexOptions.IgnoreCase))
+                { 
+                    string field = RemoveFunction(fieldMatch.Groups["Field"].Value); 
+                    fields.Add(field); 
+                }
+            } 
+
+            return fields.ToList(); 
+        }
+
+        /// <summary>
+        /// extrae los campos de un case when.
+        /// </summary>
+        /// <param name="field">Consulta a revisar.</param>
+        /// <returns>Una lista con los nombres de los campos.</returns>
+        private static string RemoveFunctionCase(string field) 
+        { 
+            var functionRegex = new Regex(@"[a-zA-Z_]+\(([^()]+)\)", RegexOptions.IgnoreCase); 
+            var match = functionRegex.Match(field); 
+            return match.Success ? match.Groups[1].Value : field; 
+        }
+
+        /// <summary>
+        /// Revisa si la consulta tiene subconsultas.
+        /// </summary>
+        /// <param name="query">Consulta a revisar.</param>
+        /// <returns>Una lista con los nombres de los campos.</returns>
+        private static bool ContainsSubquery(string query)
+        {
+            // Expresión regular para detectar subconsultas que contienen "FROM("
+            string pattern = @"\bFROM\s*\(.*?\)";
+            Regex regex = new Regex(pattern, RegexOptions.IgnoreCase);
+
+            return regex.IsMatch(query);
+        }
+
+        /// <summary>
+        /// Regresa la subconsulta de una consula para obtener los campos con los nobres de la base de datos.
+        /// </summary>
+        /// <param name="query">Consulta a revisar.</param>
+        /// <returns>Una lista con los nombres de los campos.</returns>
+        private static string ExtractSubqueries(string query)
+        {
+            StringBuilder subqueries = new StringBuilder();
+            int openParentheses = 0;
+            int startIndex = -1;
+            bool insideFromClause = false;
+
+            for (int i = 0; i < query.Length; i++)
+            {
+                // Verificamos si encontramos "FROM (" y comenzamos a buscar subconsultas
+                if (query.Substring(i).StartsWith("FROM (", StringComparison.OrdinalIgnoreCase))
+                {
+                    insideFromClause = true;
+                    i += 5; // Mover el índice para después de "FROM ("
+                    startIndex = i + 1; // Guardamos el índice de inicio de la subconsulta
+                    openParentheses++; // Contamos el primer paréntesis
+                    continue; // Continuamos al siguiente carácter
+                }
+
+                if (insideFromClause)
+                {
+                    var x = query[i];
+                    if (query[i] == '(')
+                    {
+                        openParentheses++;
+                    }
+                    else if (query[i] == ')')
+                    {
+                        openParentheses--;
+                        if (openParentheses == 0 && startIndex != -1)
+                        {
+                            // Extraemos la subconsulta, omitiendo el primer y último paréntesis
+                            string subquery = query.Substring(startIndex, i - startIndex); // Sin incluir el paréntesis de cierre
+                            subqueries.AppendLine(subquery.Trim()); // Agregamos la subconsulta al StringBuilder
+                            startIndex = -1; // Reiniciamos el índice de inicio
+                            insideFromClause = false; // Reiniciamos el estado
+                        }
+                    }
+                }
+            }
+
+            // Devolver todas las subconsultas como un solo string
+            return subqueries.Length > 0 ? subqueries.ToString() : string.Empty;
+        }
+
+        /// <summary>
+        /// Revisa la parte del select de un query para generar un diccionario con los campos utilizados en esta subparte.
+        /// </summary>
+        /// <param name="selectPart">Consulta a revisar.</param>
+        /// <returns>Una lista con los nombres de los campos.</returns>
+        private static List<string> ExtractFieldsFromSelect(string selectPart)
+        {
+            // Si contiene el * lo agregamos directamente como un campo
+            if (selectPart.Contains("*"))
+            {
+                return new List<string> { "*" };
+            }
+
+            // Eliminamos funciones y alias
+            selectPart = RemoveFunction(selectPart);
+
+            // Dividimos los campos por coma
+            var campos = selectPart.Split(',').ToList();
+
+            // Filtramos los campos numéricos.
+            selectPart = RemoveNumericFields(campos);
+
+            // Expresión regular para extraer los campos, tanto con alias como sin alias
+            var fieldRegex = new Regex(@"(\w+\.\w+|\w+)", RegexOptions.IgnoreCase);
+            return fieldRegex.Matches(selectPart)
+                             .Cast<Match>()
+                             .Select(m => m.Value)
+                             .Where(value => value != "0")
+                             .ToList();
+        }
+
+        /// <summary>
+        /// Revisa un query (Update) para generar un diccionario con los campos utilizados en la parte del SET.
+        /// </summary>
+        /// <param name="setPart">Consulta a revisar.</param>
+        /// <returns>Una lista con los nombres de los campos.</returns>
+        private static List<string> ExtractFieldsFromUpdate(string setPart)
+        {
+            // Extraemos los campos en un UPDATE desde la cláusula SET
+            var setRegex = new Regex(@"(\w+\.\w+|\w+)\s*=", RegexOptions.IgnoreCase);
+            return setRegex.Matches(setPart)
+                           .Cast<Match>()
+                           .Select(m => m.Groups[1].Value)
+                           .ToList();
+        }
+
+        /// <summary>
+        /// Revisa que en los nombres de los campos no se hayan quedado volando numeros de alguna función.
+        /// </summary>
+        /// <param name="fields">Consulta a revisar.</param>
+        /// <returns>Una cadena con los nombres de los campos sin numero que se pudieron escapar.</returns>
+        private static string RemoveNumericFields(List<string> fields)
+        {
+            // Filtra los campos para eliminar los que son números
+            var numericFreeFields = fields.Where(field =>
+            {
+                // Primero, limpiamos el campo de cualquier función o alias
+                field = RemoveFunction(field);
+
+                // Comprobamos si el campo es un número o contiene solo números y operadores (+, -, etc.)
+                return !IsNumericOrContainsNumber(field);
+            }).ToList();
+            return string.Join(", ", numericFreeFields);
+        }
+
+        /// <summary>
+        /// Función de apoyo que valida si es un numero que no pertenece a un campo.
+        /// </summary>
+        /// <param name="field">Consulta a revisar.</param>
+        /// <returns>Una booleano que indica si es un numero o no.</returns>
+        private static bool IsNumericOrContainsNumber(string field)
+        {
+            // Eliminamos espacios y verificamos si el campo es un número
+            var cleanedField = field.Replace(" ", string.Empty).Replace("+", string.Empty).Replace("-", string.Empty);
+
+            // Verifica si el campo contiene solo dígitos después de la limpieza
+            return decimal.TryParse(cleanedField, out _);
+        }
+
+        /// <summary>
+        /// Revisa un query para generar un diccionario con los campos utilizados en la parte del WHERE.
+        /// </summary>
+        /// <param name="wherePart">Consulta a revisar.</param>
+        /// <returns>Una lista con los nombres de los campos.</returns>
+        private static List<string> ExtractFieldsFromWhereClause(string wherePart)
+        {
+            wherePart = Regex.Replace(wherePart, @"\b(EXISTS|IN|In|in)\s*\([^\)]+\)", "=");
+
+            // Expresión regular para extraer campos en WHERE
+            var setRegex = new Regex(@"(\w+\.\w+|\w+)\s*=", RegexOptions.IgnoreCase);
+            return setRegex.Matches(wherePart)
+                           .Cast<Match>()
+                           .Select(m => m.Groups[1].Value)
+                           .ToList();
+        }
+
+        /// <summary>
+        /// Revisa un query para generar un diccionario con los campos utilizados en la parte del WHERE.
+        /// </summary>
+        /// <param name="fields">Campos a revisar.</param>
+        /// <param name="tableNames">Diccionario con las tablas y alias.</param>
+        /// <returns>Una lista con los nombres de las tblas y los campos.</returns>
+        private static List<object> ReplaceAliasWithTableName(List<string> fields, List<(string TableName, string Alias)> tableNames)
+        {
+            string vacio = string.Empty;
+
+            // Crear una nueva lista para almacenar los resultados
+            var updatedFields = new List<object>();
+
+            // Obtener el nombre de la tabla si solo hay una
+            string? singleTableName = tableNames.Count == 1 ? tableNames[0].TableName : null;
+
+            // Crear un conjunto de nombres de tablas y alias para comparación
+            var tableNamesSet = new HashSet<string>(tableNames.Select(t => t.TableName.ToLower()));
+            var aliasSet = new HashSet<string>(tableNames.Select(t => !string.IsNullOrEmpty(t.Alias) ? t.Alias.ToLower() : t.TableName.ToLower()));
+
+            foreach (var field in fields)
+            {
+                // Verificar si el campo no es nulo o vacío o si es de 1 solo caracter.
+                if (string.IsNullOrEmpty(field) || (field.Length == 1 && field != "*"))
+                {
+                    continue;
+                }
+
+                // Ignorar si el campo es igual al nombre de la tabla
+                if (tableNamesSet.Contains(field.ToLower()))
+                {
+                    continue; // Ignorar este campo
+                }
+
+                // Separar el campo en alias y nombre de columna
+                var parts = field.Split('.');
+                if (parts.Length == 2)
+                {
+                    var aliasOrTableName = parts[0].ToLower(); // Puede ser un alias o un nombre de tabla
+                    var columnName = parts[1].ToUpper();
+
+                    if (tableNamesSet.Contains(columnName.ToLower()))
+                    {
+                        continue; // Ignorar este campo
+                    }
+
+                    // Verificar si el alias o el nombre de la tabla existe en la lista
+                    var tableName = tableNames
+                        .FirstOrDefault(t => string.Equals(t.Alias, aliasOrTableName, StringComparison.OrdinalIgnoreCase) ||
+                                             string.Equals(t.TableName, aliasOrTableName, StringComparison.OrdinalIgnoreCase)).TableName;
+
+                    if (!string.IsNullOrEmpty(tableName))
+                    {
+                        updatedFields.Add(new { tabla = tableName, campo = columnName });
+                    }
+                    else
+                    {
+                        updatedFields.Add(new { tabla = vacio, campo = field });
+                    }
+                }
+                else
+                {
+                    // Si el campo no tiene alias
+                    if (singleTableName != null)
+                    {
+                        // Ignorar si el campo es igual al nombre de la tabla
+                        if (!tableNamesSet.Contains(field.ToLower()))
+                        {
+                            updatedFields.Add(new { tabla = singleTableName, campo = field });
+                        }
+                    }
+                    else
+                    {
+                        // Si no hay alias y hay más de una tabla, mantener el campo original sin cambios
+                        updatedFields.Add(new { tabla = vacio, campo = field });
+                    }
+                }
+            }
+
+            return updatedFields;
+        }
+    }
+}
